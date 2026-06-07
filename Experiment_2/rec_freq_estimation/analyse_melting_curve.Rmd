@@ -1,0 +1,390 @@
+---
+title: "melting_analysis_template"
+author: "T.PAREE, R.ALARCON,D.WANG"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,  
+                      message = FALSE,
+                      warning = FALSE)
+
+```
+
+
+# set path and import function
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(gam) # Generalized additive model 
+library(stringr)
+library(purrr)
+setwd("C:/Users/danme/Desktop/stage/code/rec_freq/volcano_test_260602")
+path <- "C:/Users/danme/Desktop/stage/code/rec_freq/"
+
+# ANALYSE THE MELTING CURVES AND EXTRACT METRICS #
+
+# Import function; 
+# all package on the function_melting_analysis.R must be installed
+source(paste0(path,"function_melting_analysis.R"))
+```
+
+# read data
+
+## PCR plate design
+
+```{r}
+# Import design (samples details and their corresponding qPCR well)
+design = read_xlsx("block2_volcano_long.xlsx")
+```
+
+## Melting cuurve
+
+```{r}
+# Import melting curve data (melting_example.txt; fluorescence ~ temperature, for each well) and format them.
+# To obtain the melting_example.txt file in the Roche480 software, 
+# you go into melting curve analysis and right-click on the melting curve figures 
+# => export data => .txt
+
+rawd1 = readHRM("02062026_DWRA_volcano_plate1_meltingcurve.txt")
+rawd2 = readHRM("02062026_DWRA_volcano_plate2_meltingcurve.txt")
+```
+
+## amplification curve
+
+```{r}
+# Import and format the amplification phase data (ampli_example.txt)
+# This file is only used to filter out samples with falied/weird amplification
+# To obtain "ampli_example.txt" in the Roche480 software, you right-click on the amplification phase figure => export data => .txt
+
+df1 <- read.table("02062026_DWRA_volcano1_amplicurve.txt", header = TRUE, sep = "\t")
+write.table(df1, "02062026_DWRA_volcano1_amplicurve_2.txt", sep = "\t", dec = ",", row.names = FALSE)
+ampli1 = readAmpli("02062026_DWRA_volcano1_amplicurve_2.txt")
+
+df2 <- read.table("02062026_DWRA_volcano2_amplicurve.txt", header = TRUE, sep = "\t")
+write.table(df2, "02062026_DWRA_volcano2_amplicurve_2.txt", sep = "\t", dec = ",", row.names = FALSE)
+ampli2 = readAmpli("02062026_DWRA_volcano2_amplicurve_2.txt")
+```
+
+
+### set id for each well
+
+```{r}
+rawd1$plate_qpcr_id = "plate1"
+ampli1$plate_qpcr_id = "plate1"
+rawd2$plate_qpcr_id = "plate2"
+ampli2$plate_qpcr_id = "plate2"
+
+# to bind several plates (If so, must have a plate_qpcr_id):
+rawd=rbind(rawd1, rawd2)
+ampli = rbind(ampli1, ampli2)
+
+# Must have a unique identifier for each well (well x plate)
+rawd$id = paste0(rawd$plate_qpcr_id,"#",rawd$well_pcr)
+rawd = rawd %>%
+  left_join(design, by = "id")
+ampli$id = paste0(ampli$plate_qpcr_id,"#",ampli$well_pcr)
+ampli = ampli%>%
+  left_join(design, by = "id")
+```
+
+```{r}
+ggplot(data = rawd, aes(x = temp, y = fluo, group= id, color = calib))+
+  geom_line()
+
+ggplot(data = ampli, aes(x = cycle, y = fluo, group= id, color = calib))+
+  geom_line()
+```
+
+
+# Identify melting peak region for volcano strains
+
+## check peak temperature region
+
+```{r}
+# calib sample
+calib_raw <- subset(rawd, !is.na(ratio))
+# extract melting peak information
+extract_peaks <- function(x){
+  p <- try(
+    peak.delimitation(
+      x,
+      trange.mut = c(-100, -99),
+      trange.wt  = c(999, 1000)
+    ),
+    silent = TRUE
+  )
+  if(inherits(p, "try-error")){
+    return(NULL)
+  }
+  peaks <- p$peaks
+  peaks$id <- x$id[1]
+  peaks$ratio <- x$ratio[1]
+  return(peaks)
+}
+peak_tbl <- do.call(
+  rbind,
+  lapply(split(calib_raw, calib_raw$id), extract_peaks)
+)
+
+peak_tbl <- peak_tbl[order(peak_tbl$ratio, peak_tbl$peak), ]
+peak_tbl <- peak_tbl %>%
+  left_join(design, by = "id")
+peak_tbl
+```
+
+```{r}
+# extract peak information for calib 0%(wt) and 100%(mut)
+wt_peaks <- subset(peak_tbl, ratio.x == "0%")
+mut_peaks <- subset(peak_tbl, ratio.x == "100%")
+# summary peak temperature
+summary(wt_peaks$peak)
+summary(mut_peaks$peak)
+```
+
+
+```{r}
+# check peak temperature for all calib sample
+p <- ggplot(peak_tbl, aes(x = factor(ratio.x), y = peak, text = id)) +
+  geom_jitter(width = 0.1, height = 0, size = 2) +
+  theme_classic() +
+  xlab("Known mutant ratio") +
+  ylab("Peak temperature")
+
+ggplotly(p, tooltip = "text")
+
+# check peak temperature for competition 5
+peak_tbl_V5 <- peak_tbl %>%
+  filter(competition == "5")
+
+ggplot(peak_tbl_V5, aes(x = factor(ratio.x), y = peak)) +
+  geom_jitter(width = 0.1, height = 0, size = 2) +
+  theme_classic() +
+  xlab("Known mutant ratio") +
+  ylab("Peak temperature")
+```
+
+
+```{r}
+# define peak temperature range 
+trange.mut = c(80.5,82)
+trange.wt = c(82,83.5)
+```
+
+
+
+
+# Normalize the raw melting curve
+
+```{r}
+normd = HRM(rawd, ampli, trange.mut = trange.mut, trange.wt  = trange.wt)
+meltinfo = normd[[2]]
+meltinfo= merge(meltinfo, design) # Add design information
+```
+
+# Abnormal curve filtering
+
+```{r}
+meltinfo=badscore(meltinfo)
+plot.bad(meltinfo) 
+
+badcurve = meltinfo$id[meltinfo$badscore>0 & is.na(meltinfo$calib)]
+
+bad <- meltinfo %>%
+  filter(id %in% badcurve) # 20 bad curves
+# take out bad sample
+normd=subset.ID(normd, badcurve,out=T)
+meltinfo = normd[[2]] # 761 -> 741
+meltinfo= merge(meltinfo, design)
+
+# black --> calib sample
+# red --> high badscore
+# blue --> normal
+plot.melting.phase(normd = normd, id = "plate2#L5")
+plot.melting.phase(normd = normd, id = "plate1#F8")
+plot.melting.phase(normd = normd, id = "plate1#B18")
+# plot.melting.phase2(normd = normd, id = "plate1#A19") #Purple = heteroduplex; red = mutant; blue = wild-type.
+
+
+save(meltinfo, file = "melting_info_example.Rdata")
+```
+
+
+
+# calibration train GAM
+
+```{r, fig.height= 4, fig.width=6}
+### INFER REC-1 MUTANT FREQUENCY FROM DECREASE.NORMEBS 
+load("melting_info_example.Rdata")
+
+meltinfo <- meltinfo %>%
+  mutate(competition = 
+           case_when(competition %in% c("5","6","7","8") ~ paste0("V",competition),
+                     TRUE ~ competition))
+
+#data = subset(meltinfo, is.na(calib)) #  samples
+data = meltinfo
+```
+
+```{r}
+competitions <- c("V5", "V6", "V7", "V8")
+```
+
+```{r}
+# function
+fit_predict_one_comp <-function(comp, df) {
+  calib_df <- df %>% filter(calib == "calib",competition == comp) %>%
+    mutate( ratio = as.numeric(str_remove(ratio, "%")) / 100) %>%
+    filter(!is.na(ratio),!is.na(normEBS.decrease))
+  
+  model <- gam(ratio ~ s(normEBS.decrease, df = 4),data = calib_df)
+  
+  # If you want to plot the model
+  pgam =data.frame(xx=seq(0.0,1,0.01),
+                   yy=predict(model, newdata = data.frame(normEBS.decrease=seq(0,1,0.01))) )
+  
+  p <- ggplot()+
+  geom_point(data=calib_df,
+             aes(normEBS.decrease, ratio, color = ratio), shape=1, size=3,stroke=1)+
+  #theme_Publication2()+
+  xlab("EBS-normalized mutant melting signal")+ylab("rec-1 mutant frequency")+
+  ggtitle(paste0(comp, "calibration curve"))+
+  theme(axis.title = element_text(size=17,colour = "black", face = "bold"),    
+        axis.text = element_text(size=15, colour = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        plot.title = element_text(size = 17, hjust = -0.1, face = "bold"),
+        legend.position = "none")+
+  geom_line(data=pgam, aes(x=xx, y=yy),size=1)+
+  theme_bw()
+  
+  pred_df <- df %>% 
+    filter(competition == comp)%>%
+    mutate(predicted_freq = as.numeric(predict(model, newdata=.)))
+  
+  list(competition =comp,
+       calib = calib_df,
+       model = model,
+       prediction = pred_df,
+       curve = pgam,
+       plot = p)
+  
+}
+```
+
+```{r}
+# loop
+results <- setNames(
+  map(competitions, fit_predict_one_comp, df = meltinfo),
+  competitions
+)
+```
+
+```{r}
+summary(results$V5$model)
+summary(results$V6$model)
+summary(results$V7$model)
+summary(results$V8$model)
+```
+
+```{r}
+results$V5$plot
+results$V6$plot
+results$V7$plot
+results$V8$plot
+```
+```{r}
+predicted_all <- map_dfr(results, "prediction")
+
+write.table(
+  predicted_all,
+  file = "predicted_frequencies_block2.csv",
+  sep = ";",
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+## check near zero ampli curve
+
+```{r}
+near_zero <- predicted_all %>%
+  filter(predicted_freq < 0.05)
+
+near_zero_count <- near_zero %>%
+  dplyr::count(sample, sort = TRUE, name = "n")
+
+zero_ampli <- ampli %>%
+  filter(id %in% near_zero$id)
+zero_rawd <- rawd %>%
+  filter(id %in% near_zero$id)
+
+ggplot(data = zero_rawd, aes(x = temp, y = fluo, group= id, color = calib))+
+  geom_line()
+
+ggplot(data = zero_ampli, aes(x = cycle, y = fluo, group= id, color = calib))+
+  geom_line()
+```
+
+
+
+## check calib
+
+```{r}
+calib_pre <- predicted_all %>%
+  filter(calib == "calib")
+ggplot()+
+  geom_point(data=calib_pre,
+             aes(predicted_freq, ratio, color=ratio), shape=1, size=3,stroke=1)+
+  #theme_Publication2()+
+  xlab("predicted ratio")+ylab("rec-1 mutant frequency")+
+  theme(axis.title = element_text(size=17,colour = "black", face = "bold"),    
+        axis.text = element_text(size=15, colour = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        plot.title = element_text(size = 17, hjust = -0.1, face = "bold"),
+        legend.position = "none")+
+  theme_bw()
+```
+
+## check control
+
+```{r}
+control_pre <- predicted_all %>%
+  filter(calib == "control")
+ggplot()+
+  geom_point(data=control_pre,
+             aes(predicted_freq, ratio), shape=1, size=3,stroke=1)+
+  #theme_Publication2()+
+  xlab("predicted ratio")+ylab("rec-1 mutant frequency")+
+  theme(axis.title = element_text(size=17,colour = "black", face = "bold"),    
+        axis.text = element_text(size=15, colour = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        plot.title = element_text(size = 17, hjust = -0.1, face = "bold"),
+        legend.position = "none")+
+  theme_bw()
+```
+
+# rec-1 frequency
+
+```{r}
+data_sample <- predicted_all %>%
+  filter(is.na(calib))
+ggplot(data=data_sample,aes(generation, predicted_freq, color= pop))+
+  facet_wrap(~ competition)+
+  geom_point(shape=1, size=3,stroke=1)+
+  #theme_Publication2()+
+  xlab("generation")+ylab("rec-1 mutant frequency")+
+  theme(axis.title = element_text(size=17,colour = "black", face = "bold"),    
+        axis.text = element_text(size=15, colour = "black"),
+        strip.text = element_text(size = 15, color = "black", face = "bold"),
+        plot.title = element_text(size = 17, hjust = -0.1, face = "bold"),
+        legend.position = "none")+
+  theme_bw()
+```
+
+
